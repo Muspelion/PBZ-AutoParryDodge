@@ -1,5 +1,17 @@
 # Changelog
 
+## v1.1.0 – 2026-10-30
+
+- All enemy projectile families are now covered, so new weapons need no update: rifle bullets (also very fast ones),
+  arrows, rocks, thrown bombs, grenades, cannon shells and particle bullets. Arcing flight is predicted.
+- Thrown bombs are dodged instead of parried, because they burst on contact.
+- Boss attack `ZuoShang_MiddleAttack_03`, which the game does not announce, is dodged from its animation.
+- The horse-cart riders' fixed-key QTEs are pressed for you (parry or dodge, as the game asks).
+- When the game refuses a perfect dodge, a normal dodge is used.
+- Fixed: after death or loading a save, timers from the old session could keep the stance up.
+- Fixed: with Auto Dodge off, an attack announced for both dodge and parry was not parried.
+- Slightly larger projectile reaction range. Better timing at low frame rates.
+
 ## v1.0.2 – 2026-10-30
 
 - Uninstaller: UE4SS is no longer removed while another PBZ mod (for example

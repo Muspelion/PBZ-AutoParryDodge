@@ -45,7 +45,7 @@ i perfekcyjne uniki** przeciwko wszystkim przeciwnikom i bossom.
 
 ## 🚀 Łatwa instalacja (zalecana)
 
-1. Pobierz **`PBZ-AutoParryDodge-v1.0.2.zip`** ze strony [**Releases**](../../releases/latest).
+1. Pobierz **`PBZ-AutoParryDodge-v1.1.0.zip`** ze strony [**Releases**](../../releases/latest).
 2. Rozpakuj archiwum w dowolnym miejscu (np. na Pulpicie).
 3. **Zamknij grę.**
 4. Kliknij dwukrotnie **`install.bat`**.

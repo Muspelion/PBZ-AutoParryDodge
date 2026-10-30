@@ -34,8 +34,9 @@ local CFG = {
     lookahead = 1.5,             -- seconds of MaxPreimpactTime to query
     resetSpamPenalty = true,
     projectiles = true,          -- predict arrival of enemy projectiles (rocks, arrows, bullets)
-    projectileRadius = 150,      -- uu; a projectile passing closer than this counts as a hit
-    wideProjectileRadius = 350,  -- uu; for wide projectiles (waves, slashes) whose centre passes further away
+    projectileRadius = 180,      -- uu; a projectile passing closer than this counts as a hit
+    unannouncedRange = 6000,     -- uu; enemies further than this cannot land an unannounced attack (riders shoot from 30 m)
+    wideProjectileRadius = 380,  -- uu; for wide projectiles (waves, slashes) whose centre passes further away
     log = false,                 -- true = write autocombat.log next to this mod (for bug reports)
 }
 
@@ -50,10 +51,11 @@ end)()
 
 local LOG_PATH = MOD_DIR .. "autocombat.log"
 local DODGE_TAG = "Ability.Action.Hun.PerfectDodge"
+local DASH_TAG = "Ability.Action.Hun.Dash" -- perfect dodge is refused without a dodge frame; the plain dash is not
 
 -- Reloading the mod (UE4SS hot reload) stops the previous instance.
 if _G.PBZAutoCombat then _G.PBZAutoCombat.stopped = true end
-local S = { stopped = false, done = {}, seen = {}, checks = {}, proj = {}, ghosts = {}, releaseAt = 0, refreshAt = 0, cfg = CFG }
+local S = { stopped = false, done = {}, seen = {}, checks = {}, proj = {}, unannounced = {}, ghosts = {}, releaseAt = 0, refreshAt = 0, cfg = CFG }
 _G.PBZAutoCombat = S
 
 local logFile = CFG.log and io.open(LOG_PATH, "a") or nil
@@ -161,6 +163,7 @@ end
 local function refresh(now)
     S.pawn = possessedPawn()
     S.deflect, S.dc, S.input, S.window, S.windowBreak = nil, nil, nil, nil, nil
+    S.refreshAt = now + 1.0 -- also when this pawn has no combat components (cutscene actors)
     if not valid(S.pawn) then return end
     S.deflect = findLive("BP_PlayerDeflectPassive_C", S.pawn)
     S.dc = findLive("DeflectComponent", S.pawn)
@@ -173,7 +176,6 @@ local function refresh(now)
         S.window = cfg["Get Deflect Perfect Window Frames"](cfg) / rate
         S.windowBreak = cfg["Get Deflect Perfect Window Frames On Break"](cfg) / rate
     end)
-    S.refreshAt = now + 1.0
 end
 
 local function parryLead(inBreak)
@@ -240,7 +242,13 @@ local function doDodge(now, hit, handle)
     local ok, r = pcall(function()
         return S.input:TryActivateExternalActionAbilityInterruptLowerByTag({ TagName = FName(DODGE_TAG) }, IA_Dodge, -5)
     end)
-    log("DODGE", string.format("h=%d lead=%.3f", handle, hit - now), ok and tostring(r) or r)
+    local dashed = nil
+    if ok and r == false then
+        pcall(function()
+            dashed = S.input:TryActivateExternalActionAbilityInterruptLowerByTag({ TagName = FName(DASH_TAG) }, IA_Dodge, -5)
+        end)
+    end
+    log("DODGE", string.format("h=%d lead=%.3f", handle, hit - now), ok and tostring(r) or r, dashed ~= nil and "dash=" .. tostring(dashed) or "")
 end
 
 -- Diagnostics for unannounced hits: which animation montages the characters near the player are playing.
@@ -265,7 +273,29 @@ function attackerMontages()
     return ok and table.concat(out, " ") or "?"
 end
 
-local PROJECTILE_CLASSES = { "BP_PBZ_ProjectileBullet_C", "BP_PBZ_ProjectileBullet_ActorHead_C", "PBZ_ProjectileBullet" }
+-- Native roots, so every weapon is covered without listing it (FindAllOf includes subclasses). This list of all
+-- 838 enemy ranged attacks in the game files covers bullets (rifles, arrows, rocks, darts, waves),
+-- emitters (thrown bombs, grenades, cannon shells) and particle bullets.
+local PROJECTILE_CLASSES = { "PBZ_ProjectileBullet", "PBZ_ProjectileEmitter", "PBZ_ParticleBullet" }
+
+-- Time and distance of the closest approach to the player. r = player - projectile, az = measured vertical
+-- acceleration: arcing projectiles (GravityScale > 0) would otherwise look like they fly over the player.
+local function closestApproach(rx, ry, rz, vx, vy, vz, az)
+    if az > -100 then
+        local v2 = vx * vx + vy * vy + vz * vz
+        local tca = (rx * vx + ry * vy + rz * vz) / v2
+        local mx, my, mz = rx - vx * tca, ry - vy * tca, rz - vz * tca
+        return tca, math.sqrt(mx * mx + my * my + mz * mz)
+    end
+    local bestT, best = 0, math.huge
+    for i = 0, 200 do
+        local t = i * 0.01
+        local mx, my, mz = rx - vx * t, ry - vy * t, rz - vz * t - 0.5 * az * t * t
+        local d = mx * mx + my * my + mz * mz
+        if d < best then bestT, best = t, d end
+    end
+    return bestT, math.sqrt(best)
+end
 
 function trackProjectiles(now, dt, wantParry, wantDodge)
     local me = S.pawn:K2_GetActorLocation()
@@ -278,27 +308,41 @@ function trackProjectiles(now, dt, wantParry, wantDodge)
                 alive[addr] = true
                 local st = S.proj[addr]
                 local p = o:K2_GetActorLocation()
-                local radius = st and st.radius or CFG.projectileRadius
-                local jumped = st and ((p.X - st.x) ^ 2 + (p.Y - st.y) ^ 2 + (p.Z - st.z) ^ 2) > 800 * 800
-                if not st or jumped then
+                local step = st and now - st.t or 0
+                local jumpLimit = st and math.max(800, 45000 * step) or 0
+                local dist2 = st and (p.X - st.x) ^ 2 + (p.Y - st.y) ^ 2 + (p.Z - st.z) ^ 2 or 0
+                local fresh = not st or dist2 > jumpLimit * jumpLimit
+                if fresh then
                     -- New projectile, or a pooled one re-fired (teleported): start tracking afresh.
                     local owner = nil
                     pcall(function() owner = o:GetOwner() end)
                     local mine = valid(owner) and owner:GetAddress() == pawnAddr
                     local name = o:GetFName():ToString()
                     local wide = name:find("Wave") or name:find("Slash") or name:find("Blade")
-                    S.proj[addr] = { x = p.X, y = p.Y, z = p.Z, t = now, mine = mine, done = mine,
-                        radius = wide and CFG.wideProjectileRadius or CFG.projectileRadius }
-                elseif now > st.t and (not st.done or now < (st.hit or 0)) then
-                    local step = now - st.t
-                    local vx, vy, vz = (p.X - st.x) / step, (p.Y - st.y) / step, (p.Z - st.z) / step
+                    st = { mine = mine, done = mine, radius = wide and CFG.wideProjectileRadius or CFG.projectileRadius }
+                    S.proj[addr] = st
+                end
+                if not st.done or now < (st.hit or 0) then
+                    -- The actor's own velocity is there on the first frame: the fastest rifle bullets arrive in a
+                    -- frame or two, before a position difference exists. Otherwise measure it from the movement.
+                    local vx, vy, vz = 0, 0, 0
+                    local ok, v = pcall(function() return o:GetVelocity() end)
+                    if ok and v then vx, vy, vz = v.X, v.Y, v.Z end
+                    if vx * vx + vy * vy + vz * vz <= 100 and not fresh and step > 0 then
+                        vx, vy, vz = (p.X - st.x) / step, (p.Y - st.y) / step, (p.Z - st.z) / step
+                    end
                     local v2 = vx * vx + vy * vy + vz * vz
-                    if v2 > 100 and v2 < 20000 * 20000 then -- moving, and not a teleport
+                    if v2 > 100 and (fresh or dist2 > 0) then -- moving; a stale velocity on a parked projectile does not count
+                        local measured = st.vz ~= nil and step > 0 -- az needs two velocity samples
+                        local az = measured and math.max(-4000, math.min(0, (vz - st.vz) / step)) or 0
+                        st.vz = vz
                         local rx, ry, rz = me.X - p.X, me.Y - p.Y, me.Z - p.Z
-                        local tca = (rx * vx + ry * vy + rz * vz) / v2          -- time of closest approach
-                        local mx, my, mz = rx - vx * tca, ry - vy * tca, rz - vz * tca
-                        local miss = math.sqrt(mx * mx + my * my + mz * mz)
-                        if tca > 0 and miss <= radius then
+                        local tca, miss = closestApproach(rx, ry, rz, vx, vy, vz, az)
+                        if not st.seen and not st.mine and tca > 0 then
+                            st.seen = true
+                            log("SHOT", string.format("%s t=%.3f speed=%.0f eta=%.3f miss=%.0f", o:GetFName():ToString(), now, math.sqrt(v2), tca, miss))
+                        end
+                        if tca > 0 and miss <= st.radius then
                             if not st.logged then
                                 st.logged = true
                                 log("PROJ", string.format("%s speed=%.0f eta=%.3f miss=%.0f", o:GetFName():ToString(), math.sqrt(v2), tca, miss))
@@ -308,21 +352,110 @@ function trackProjectiles(now, dt, wantParry, wantDodge)
                             if not st.done and tca - dt <= parryLead(false) then
                                 st.done = true
                                 local hit = now + tca
-                                if wantParry and not stanceForbidden() then doParry(now, hit, -1)
+                                -- Bombs burst on contact, so a parry still takes the explosion: leave the spot instead.
+                                if cls == "PBZ_ProjectileEmitter" and wantDodge then doDodge(now, hit, -1)
+                                elseif wantParry and not stanceForbidden() then doParry(now, hit, -1)
                                 elseif wantDodge then doDodge(now, hit, -1) end
                             end
                         end
                     end
-                    st.x, st.y, st.z, st.t = p.X, p.Y, p.Z, now
-                else
-                    st.x, st.y, st.z, st.t = p.X, p.Y, p.Z, now
                 end
+                st.x, st.y, st.z, st.t = p.X, p.Y, p.Z, now
             end
         end
     end
     for addr in pairs(S.proj) do
         if not alive[addr] then S.proj[addr] = nil end
     end
+end
+
+-- Attacks the game does not announce in ReceiveFrames: montage name -> hit times in seconds from the montage start,
+-- read from the ability timeline (ZuoShang_MiddleAttack_03_Montage is GA_ZuoShang_SpecialAttack_07).
+local UNANNOUNCED_HITS = {
+    ZuoShang_MiddleAttack_03_Montage = { 0.685, 0.936 },
+}
+
+-- QTEs with a fixed key: montage -> window in seconds from the montage start, and the key the game waits for.
+-- The other QTEs in the game draw a random key, which the game does not expose to us.
+local TIMED_QTE = {
+    GuiChai_Horse_Gun_Skill_01_Montage = { from = 0.777, to = 1.296, action = "/PBZDeflectSystem/Input/IA_Deflect.IA_Deflect" },
+    GuiChai_Horse_Gun_Skill_03_Montage = { from = 0.865, to = 1.392, action = "/PBZDeflectSystem/Input/IA_Dodge.IA_Dodge" },
+}
+
+-- Holds the key for the middle of the window, one injected frame at a time.
+local function pressQte(name, qte, pos, now)
+    if pos < qte.from + 0.1 or pos > qte.to - 0.1 then return end
+    local ok, err = pcall(function()
+        if not valid(S.enhanced) then S.enhanced = findLive("EnhancedInputLocalPlayerSubsystem") end
+        S.enhanced:InjectInputVectorForAction(StaticFindObject(qte.action), { X = 1.0, Y = 0.0, Z = 0.0 }, {}, {})
+    end)
+    if now >= (qte.logAt or 0) or not ok then
+        qte.logAt = now + 1
+        log("QTE", name, string.format("pos=%.3f", pos), ok and "" or tostring(err))
+    end
+end
+
+local function refreshNearEnemies(now)
+    S.near = {}
+    S.nearAt = now + 0.25
+    local me = S.pawn:K2_GetActorLocation()
+    for _, c in ipairs(FindAllOf("Character") or {}) do
+        if valid(c) and c:GetClass():GetFName():ToString():find("^BP_Monster_") then
+            local p = c:K2_GetActorLocation()
+            if (p.X - me.X) ^ 2 + (p.Y - me.Y) ^ 2 + (p.Z - me.Z) ^ 2 < CFG.unannouncedRange ^ 2 then
+                S.near[#S.near + 1] = c
+            end
+        end
+    end
+end
+
+local function trackUnannounced(now, dt, wantDodge)
+    if now >= (S.nearAt or 0) then refreshNearEnemies(now) end
+    for _, c in ipairs(S.near) do
+        if valid(c) then
+            local anim, m = nil, nil
+            pcall(function()
+                anim = c.Mesh:GetAnimInstance()
+                m = anim:GetCurrentActiveMontage()
+            end)
+            local name = valid(m) and m:GetFName():ToString() or nil
+            local hits = name and UNANNOUNCED_HITS[name]
+            local qte = name and TIMED_QTE[name]
+            if qte then pressQte(name, qte, anim:Montage_GetPosition(m), now) end
+            local addr = c:GetAddress()
+            if hits then
+                local pos = anim:Montage_GetPosition(m)
+                local st = S.unannounced[addr]
+                if not st or pos < st.pos then st = { next = 1 } S.unannounced[addr] = st end
+                st.pos = pos
+                while hits[st.next] and pos > hits[st.next] + 0.05 do st.next = st.next + 1 end -- seen too late
+                local hit = hits[st.next]
+                if hit and wantDodge and pos + dt + CFG.dodgeLead >= hit then
+                    st.next = st.next + 1
+                    log("UNANNOUNCED", name, string.format("pos=%.3f hit=%.3f", pos, hit))
+                    doDodge(now, now + math.max(0, hit - pos), -2)
+                end
+            else
+                S.unannounced[addr] = nil
+            end
+        end
+    end
+end
+
+local trackErrors = 0
+local function guarded(fn, ...)
+    local ok, err = pcall(fn, ...)
+    if not ok then
+        trackErrors = trackErrors + 1
+        if trackErrors <= 20 then log("ERROR", err) end
+    end
+end
+
+-- Game time restarts with every level load (death, checkpoint): everything scheduled on the old clock is void.
+local function resetForNewWorld()
+    log("WORLD time restarted")
+    S.done, S.seen, S.checks, S.proj, S.unannounced, S.ghosts, S.near = {}, {}, {}, {}, {}, {}, {}
+    S.releaseAt, S.refreshAt, S.nearAt, S.lastHp, S.lastNow, S.tipHideAt = 0, 0, 0, nil, nil, nil
 end
 
 local function tick()
@@ -334,6 +467,7 @@ local function tick()
         if not valid(S.pawn) then return end
     end
     local now = GS:GetTimeSeconds(S.pawn)
+    if S.lastNow and now < S.lastNow - 0.5 then resetForNewWorld() end
     if now >= S.refreshAt then refresh(now) end
 
     -- Settings file (external edits) once per second; on-screen status on world entry and on changes.
@@ -359,7 +493,7 @@ local function tick()
 
     -- Every HP loss, once (RESULT checks overlap during flurries, so one hit can show up in several of them).
     local hpNow = playerHealth()
-    if hpNow and S.lastHp and hpNow < S.lastHp - 0.5 then
+    if logFile and hpNow and S.lastHp and hpNow < S.lastHp - 0.5 then
         log("DAMAGE", string.format("-%.1f HP", S.lastHp - hpNow), S.releaseAt > 0 and "key held" or "key up", attackerMontages())
     end
     S.lastHp = hpNow
@@ -372,7 +506,7 @@ local function tick()
     -- in the out struct).
     -- Act one frame early rather than one frame late: compare against the time left after the next frame.
     local dt = now - (S.lastNow or now)
-    if dt < 0 or dt > 0.1 then dt = 0 end
+    if dt < 0 then dt = 0 elseif dt > 0.1 then dt = 0.1 end
     S.lastNow = now
 
     local fp, fd = { HitGameTime = math.huge }, { HitGameTime = math.huge }
@@ -453,7 +587,9 @@ local function tick()
             end
         end
     end
-    if CFG.projectiles and (wantParry or wantDodge) then trackProjectiles(now, dt, wantParry, wantDodge) end
+    -- An error in the tracking must not skip the key release below: the stance would stay up.
+    if CFG.projectiles and (wantParry or wantDodge) then guarded(trackProjectiles, now, dt, wantParry, wantDodge) end
+    if wantParry or wantDodge then guarded(trackUnannounced, now, dt, wantDodge) end
     maybeRelease(now)
 
     -- Outcome of our actions: did the player lose HP around the hit?
@@ -476,10 +612,11 @@ local function tick()
             S.done[hd] = true
         elseif t - dt <= CFG.dodgeLead then
             S.done[hd] = true
+            local handled = wantDodge or (wantParry and CFG.mode == "parry")
             if wantDodge then doDodge(now, fd.HitGameTime, hd)
-            elseif wantParry and CFG.mode == "parry" then doParry(now, fd.HitGameTime, hd) end
-            -- the matching deflect frame of the same attack is skipped
-            if hp >= 0 and math.abs(fp.HitGameTime - fd.HitGameTime) <= CFG.bothWithin then S.done[hp] = true end
+            elseif handled then doParry(now, fd.HitGameTime, hd) end
+            -- the matching deflect frame of the same attack is skipped, unless nothing was pressed for it
+            if handled and hp >= 0 and math.abs(fp.HitGameTime - fd.HitGameTime) <= CFG.bothWithin then S.done[hp] = true end
         end
     end
 
