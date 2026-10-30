@@ -98,7 +98,11 @@ if (Test-Path $modsJson) {
 }
 Say "Mod removed." Green
 
-if (Test-Path (Join-Path $Ue4ss $Marker)) {
+# Other mods still use UE4SS (for example PBZ Auto Weapon Switch): keep it.
+$others = @(Get-ChildItem $Mods -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "PBZ*" } | ForEach-Object { $_.Name })
+if ($others.Count -gt 0) {
+    Say "UE4SS is kept because other mods still use it: $($others -join ', ')." Yellow
+} elseif (Test-Path (Join-Path $Ue4ss $Marker)) {
     if (-not $RemoveUE4SS -and -not $NoPause) {
         $RemoveUE4SS = (Read-Host "UE4SS was installed together with this mod. Remove UE4SS too? (y/N)") -match '^[yY]'
     }
