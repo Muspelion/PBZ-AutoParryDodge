@@ -45,7 +45,7 @@ perfectas** contra todos los enemigos y jefes.
 
 ## 🚀 Instalación fácil (recomendada)
 
-1. Descarga **`PBZ-AutoParryDodge-v1.0.1.zip`** desde la página [**Releases**](../../releases/latest).
+1. Descarga **`PBZ-AutoParryDodge-v1.0.2.zip`** desde la página [**Releases**](../../releases/latest).
 2. Descomprime el archivo donde quieras (por ejemplo, en el Escritorio).
 3. **Cierra el juego.**
 4. Haz doble clic en **`install.bat`**.

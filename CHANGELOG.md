@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.0.2 – 2026-10-30
+
+- Uninstaller: UE4SS is no longer removed while another PBZ mod (for example
+  [PBZ Auto Weapon Switch](https://github.com/Muspelion/PBZ-AutoWeaponSwitch)) still uses it.
+
 ## v1.0.1 – 2026-10-30
 
 - Fixed: the mod could follow the wrong character in chapters that keep several player characters in the level
