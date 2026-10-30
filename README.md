@@ -45,7 +45,7 @@ against every enemy and boss.
 
 ## 🚀 Easy installation (recommended)
 
-1. Download **`PBZ-AutoParryDodge-v1.0.0.zip`** from the [**Releases**](../../releases/latest) page.
+1. Download **`PBZ-AutoParryDodge-v1.0.1.zip`** from the [**Releases**](../../releases/latest) page.
 2. Unpack the zip anywhere (for example on the Desktop).
 3. **Close the game.**
 4. Double-click **`install.bat`**.

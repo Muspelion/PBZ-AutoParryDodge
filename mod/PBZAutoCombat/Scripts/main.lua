@@ -27,11 +27,15 @@ local CFG = {
     parryMaxLead = 0.15,
     dodgeLead = 0.045,           -- built-in assist triggers at <= 0.04 s
     releaseAfterHit = 0.10,      -- keep the key "held" this long after the last parried hit
+    holdGap = 0.35,              -- don't release if the next hit lands sooner than this (flurries): keep blocking
+    maxHold = 2.5,               -- but never hold longer than this in one go (stance drains while held)
+    ghostWithin = 0.4,           -- a deflect frame withdrawn this close to its hit is still parried on time
     bothWithin = 0.10,           -- deflect and dodge frames this close count as one attack
     lookahead = 1.5,             -- seconds of MaxPreimpactTime to query
     resetSpamPenalty = true,
     projectiles = true,          -- predict arrival of enemy projectiles (rocks, arrows, bullets)
     projectileRadius = 150,      -- uu; a projectile passing closer than this counts as a hit
+    wideProjectileRadius = 350,  -- uu; for wide projectiles (waves, slashes) whose centre passes further away
     log = false,                 -- true = write autocombat.log next to this mod (for bug reports)
 }
 
@@ -49,7 +53,7 @@ local DODGE_TAG = "Ability.Action.Hun.PerfectDodge"
 
 -- Reloading the mod (UE4SS hot reload) stops the previous instance.
 if _G.PBZAutoCombat then _G.PBZAutoCombat.stopped = true end
-local S = { stopped = false, done = {}, seen = {}, checks = {}, proj = {}, releaseAt = 0, refreshAt = 0, cfg = CFG }
+local S = { stopped = false, done = {}, seen = {}, checks = {}, proj = {}, ghosts = {}, releaseAt = 0, refreshAt = 0, cfg = CFG }
 _G.PBZAutoCombat = S
 
 local logFile = CFG.log and io.open(LOG_PATH, "a") or nil
@@ -141,8 +145,21 @@ local function showTip(text, now)
     S.tipHideAt = (now or 0) + 3.0
 end
 
+-- The pawn the player actually controls. Some chapters keep several Hun pawns in the level at once
+-- (BP_Renewal_Hun_C, BP_Renewal_Hun_Young_C, BP_Renewal_Hun_Climax_C), so "the first instance of the class"
+-- can be an idle one that never receives any attack.
+local function possessedPawn()
+    for _, pc in ipairs(FindAllOf("PlayerController") or {}) do
+        if valid(pc) and not pc:GetFName():ToString():find("^Default__") then
+            local ok, p = pcall(function() return pc.Pawn end)
+            if ok and valid(p) then return p end
+        end
+    end
+    return findLive("BP_Renewal_Hun_C")
+end
+
 local function refresh(now)
-    S.pawn = findLive("BP_Renewal_Hun_C")
+    S.pawn = possessedPawn()
     S.deflect, S.dc, S.input, S.window, S.windowBreak = nil, nil, nil, nil, nil
     if not valid(S.pawn) then return end
     S.deflect = findLive("BP_PlayerDeflectPassive_C", S.pawn)
@@ -186,6 +203,7 @@ local function doParry(now, hit, handle)
     expectHit("PARRY", hit, handle)
     local d = S.deflect
     if CFG.resetSpamPenalty then pcall(function() d["Reset Perfect Window Punishment"](d) end) end
+    if S.releaseAt == 0 then S.heldSince = now end
     d["Stance Key Down"] = true
     local ok1, e1 = pcall(function() d["Give Perfect Window"](d) end)
     local ok2, e2 = pcall(function() d["Activate Stance Ability"](d, {}) end)
@@ -198,6 +216,23 @@ local function releaseKey()
     local d = S.deflect
     pcall(function() d["On Stance Key Release"](d) end)
     S.releaseAt = 0
+    S.holdLogged = false
+end
+
+-- Releasing between closely spaced hits and pressing again lets one of them through, so during a flurry
+-- the key stays down (the stance blocks) and each hit still gets its own fresh perfect window.
+local function maybeRelease(now)
+    if S.releaseAt == 0 or now < S.releaseAt then return end
+    local gap = (S.nextThreat or math.huge) - now
+    if gap <= CFG.holdGap and now - (S.heldSince or now) < CFG.maxHold then
+        S.releaseAt = now + 0.05
+        if not S.holdLogged then
+            S.holdLogged = true
+            log("HOLD", string.format("next hit in %.3fs", gap))
+        end
+        return
+    end
+    releaseKey()
 end
 
 local function doDodge(now, hit, handle)
@@ -206,6 +241,28 @@ local function doDodge(now, hit, handle)
         return S.input:TryActivateExternalActionAbilityInterruptLowerByTag({ TagName = FName(DODGE_TAG) }, IA_Dodge, -5)
     end)
     log("DODGE", string.format("h=%d lead=%.3f", handle, hit - now), ok and tostring(r) or r)
+end
+
+-- Diagnostics for unannounced hits: which animation montages the characters near the player are playing.
+function attackerMontages()
+    local out = {}
+    local ok = pcall(function()
+        local me = S.pawn:K2_GetActorLocation()
+        local pawnAddr = S.pawn:GetAddress()
+        for _, c in ipairs(FindAllOf("Character") or {}) do
+            if valid(c) and c:GetAddress() ~= pawnAddr and not c:GetFName():ToString():find("^Default__") then
+                local p = c:K2_GetActorLocation()
+                local d = math.sqrt((p.X - me.X) ^ 2 + (p.Y - me.Y) ^ 2 + (p.Z - me.Z) ^ 2)
+                if d < 3000 then
+                    local m = nil
+                    pcall(function() m = c.Mesh:GetAnimInstance():GetCurrentActiveMontage() end)
+                    out[#out + 1] = string.format("%s@%.0f:%s", c:GetClass():GetFName():ToString(), d,
+                        valid(m) and m:GetFName():ToString() or "-")
+                end
+            end
+        end
+    end)
+    return ok and table.concat(out, " ") or "?"
 end
 
 local PROJECTILE_CLASSES = { "BP_PBZ_ProjectileBullet_C", "BP_PBZ_ProjectileBullet_ActorHead_C", "PBZ_ProjectileBullet" }
@@ -221,14 +278,18 @@ function trackProjectiles(now, dt, wantParry, wantDodge)
                 alive[addr] = true
                 local st = S.proj[addr]
                 local p = o:K2_GetActorLocation()
+                local radius = st and st.radius or CFG.projectileRadius
                 local jumped = st and ((p.X - st.x) ^ 2 + (p.Y - st.y) ^ 2 + (p.Z - st.z) ^ 2) > 800 * 800
                 if not st or jumped then
                     -- New projectile, or a pooled one re-fired (teleported): start tracking afresh.
                     local owner = nil
                     pcall(function() owner = o:GetOwner() end)
                     local mine = valid(owner) and owner:GetAddress() == pawnAddr
-                    S.proj[addr] = { x = p.X, y = p.Y, z = p.Z, t = now, mine = mine, done = mine }
-                elseif not st.done and now > st.t then
+                    local name = o:GetFName():ToString()
+                    local wide = name:find("Wave") or name:find("Slash") or name:find("Blade")
+                    S.proj[addr] = { x = p.X, y = p.Y, z = p.Z, t = now, mine = mine, done = mine,
+                        radius = wide and CFG.wideProjectileRadius or CFG.projectileRadius }
+                elseif now > st.t and (not st.done or now < (st.hit or 0)) then
                     local step = now - st.t
                     local vx, vy, vz = (p.X - st.x) / step, (p.Y - st.y) / step, (p.Z - st.z) / step
                     local v2 = vx * vx + vy * vy + vz * vz
@@ -237,12 +298,14 @@ function trackProjectiles(now, dt, wantParry, wantDodge)
                         local tca = (rx * vx + ry * vy + rz * vz) / v2          -- time of closest approach
                         local mx, my, mz = rx - vx * tca, ry - vy * tca, rz - vz * tca
                         local miss = math.sqrt(mx * mx + my * my + mz * mz)
-                        if tca > 0 and miss <= CFG.projectileRadius then
+                        if tca > 0 and miss <= radius then
                             if not st.logged then
                                 st.logged = true
                                 log("PROJ", string.format("%s speed=%.0f eta=%.3f miss=%.0f", o:GetFName():ToString(), math.sqrt(v2), tca, miss))
                             end
-                            if tca - dt <= parryLead(false) then
+                            st.hit = now + tca
+                            if now + tca < S.nextThreat then S.nextThreat = now + tca end
+                            if not st.done and tca - dt <= parryLead(false) then
                                 st.done = true
                                 local hit = now + tca
                                 if wantParry and not stanceForbidden() then doParry(now, hit, -1)
@@ -294,7 +357,12 @@ local function tick()
     end
     if not (valid(S.dc) and valid(S.deflect)) then return end
 
-    if S.releaseAt > 0 and now >= S.releaseAt then releaseKey() end
+    -- Every HP loss, once (RESULT checks overlap during flurries, so one hit can show up in several of them).
+    local hpNow = playerHealth()
+    if hpNow and S.lastHp and hpNow < S.lastHp - 0.5 then
+        log("DAMAGE", string.format("-%.1f HP", S.lastHp - hpNow), S.releaseAt > 0 and "key held" or "key up", attackerMontages())
+    end
+    S.lastHp = hpNow
 
     local wantParry = CFG.parry and CFG.mode ~= "dodge"
     local wantDodge = CFG.dodge and CFG.mode ~= "parry"
@@ -310,6 +378,7 @@ local function tick()
     local fp, fd = { HitGameTime = math.huge }, { HitGameTime = math.huge }
     local hp, hd = -1, -1
     local present = {}
+    local nextFuture = math.huge
     S.dc.ReceiveFrames:ForEach(function(key, value)
         local handle = key:get()
         local frame = value:get()
@@ -344,6 +413,7 @@ local function tick()
             if hit < fd.HitGameTime then hd, fd.HitGameTime = handle, hit end
         else
             if hit < fp.HitGameTime then hp, fp.HitGameTime = handle, hit end
+            if hit > now and hit < nextFuture then nextFuture = hit end
         end
     end)
 
@@ -352,6 +422,12 @@ local function tick()
         if not present[handle] then
             if not S.done[handle] and info.hit > -1e30 then
                 log("LOST", string.format("h=%d dodge=%s %.3fs before hit", handle, tostring(info.dodge), info.hit - now))
+                -- In flurries the game sometimes withdraws a frame shortly before its hit and re-announces it
+                -- only after the hit has landed. Keep parrying it at the time it was announced for.
+                local left = info.hit - now
+                if not info.dodge and left > 0 and left < CFG.ghostWithin then
+                    S.ghosts[#S.ghosts + 1] = { hit = info.hit, handle = handle }
+                end
             end
             S.seen[handle] = nil
             S.done[handle] = nil
@@ -360,7 +436,25 @@ local function tick()
 
     -- Projectiles: their deflect frame is untimed and vanishes at launch; the game resolves the deflect when
     -- the projectile touches the player (open window = deflected). Predict the arrival ourselves.
+    S.nextThreat = nextFuture
+    for i = #S.ghosts, 1, -1 do
+        local g = S.ghosts[i]
+        local t = g.hit - now
+        if t < 0 then
+            table.remove(S.ghosts, i)
+        else
+            if g.hit < S.nextThreat then S.nextThreat = g.hit end
+            if t - dt <= parryLead(false) then
+                table.remove(S.ghosts, i)
+                if wantParry and not stanceForbidden() then
+                    log("GHOST", "h=" .. g.handle)
+                    doParry(now, g.hit, g.handle)
+                end
+            end
+        end
+    end
     if CFG.projectiles and (wantParry or wantDodge) then trackProjectiles(now, dt, wantParry, wantDodge) end
+    maybeRelease(now)
 
     -- Outcome of our actions: did the player lose HP around the hit?
     for i = #S.checks, 1, -1 do

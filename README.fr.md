@@ -45,7 +45,7 @@ esquives parfaites**, contre tous les ennemis et tous les boss.
 
 ## 🚀 Installation facile (recommandée)
 
-1. Téléchargez **`PBZ-AutoParryDodge-v1.0.0.zip`** depuis la page [**Releases**](../../releases/latest).
+1. Téléchargez **`PBZ-AutoParryDodge-v1.0.1.zip`** depuis la page [**Releases**](../../releases/latest).
 2. Décompressez l'archive où vous voulez (par exemple sur le Bureau).
 3. **Fermez le jeu.**
 4. Double-cliquez sur **`install.bat`**.
